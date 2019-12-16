@@ -1,0 +1,218 @@
+---
+title: "Geospatial Filtering"
+author: "Michael Gordon"
+date: "Last modified: `r format(Sys.time(), '%d-%b-%Y')`"
+always_allow_html: yes
+output:
+ bookdown::html_document2:
+  number_sections: no
+  toc: no
+ html_notebook:
+  number_sections: no
+  toc: no
+ pdf_document:
+  number_sections: no
+  toc: yes
+ word_document:
+  # number_sections: yes
+  toc: yes
+---
+
+## Introduction
+
+I was working on a project recently where we were doing some analysis on what affects the weather has on wholesale electricity pricing in Australia, the two main data sets we had was firstly weather data provided by the Australian Bureau of Meteorology (BOM) including daily temperature, rainfall and solar exposure readings from weather stations across the country, and secondly wholesale electricity pricing data from the Australia Electricity Market Operator (AEMO) which provided electricity pricing data at a state level.
+
+Because the AEMO data is a wholesale price at a state level we needed to make a decision about which parts of the country we were going to focus on in the BOM dataset as aggregating the readings from all weather stations in each state would platten everything out to much, so I decided to filter down to readings from weather stations located in major cities and since we had data on solar exposure readings I also decided to include weather stations located closest to solar farms.
+
+To identify which weather stations are located in the major cities I used Significante Urban Areas shape file provided by the Australian Bureau of Statistics (ABS), and wrote some code based off the following stack exchange article: https://gis.stackexchange.com/questions/133625/checking-if-points-fall-within-polygon-shapefile/133628#133628
+
+This approach worked however I was never really satisfied with the code so I went searching for alternatives which is how I found the *sf* library, and this allowed me to simplify the whole process and write much tidier code, it took me a while to figure out how to use *sf* to do what I wanted so I thought I would write up a quick vignette.
+
+So to start with these are the libraries I am using:
+
+
+```{r libraries, message=FALSE}
+library(tidyverse)
+library(leaflet) 
+library(geosphere)
+library(rgdal)
+library(sf)
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+theme_set(theme_bw())
+theme_update( plot.title = element_text(hjust=0.5)
+            , plot.subtitle = element_text(hjust=0.5)
+            )
+```
+
+And here I'm loading the data sets, shapefile and defining the major cities I am interested in:
+```{r loading data, message=FALSE, results='hide'}
+weather_stations <- readRDS(paste0(getwd(), "/data/BOM/weather_stations_v2.rds")) %>% 
+    ungroup() %>% 
+    mutate(lat = as.numeric(lat), lon = as.numeric(lon))
+
+solar_farm_details <- readRDS(paste0(getwd(), "/data/BOM/solar_farms.rds")) %>%
+  mutate(lats = as.numeric(lats), lons = as.numeric(lons))
+
+urban_areas_au <- read_sf("data/ABS/shapes/SUA_2016_AUST.shp")
+# I'm loading the shapefile a second time using the rgdal::readORG function as this works 
+# better for plotting the polygons over a leaflet map.
+map <- readOGR("data/ABS/shapes/SUA_2016_AUST.shp")
+
+major_cities <- c("Sydney", "Melbourne", "Adelaide", "Brisbane", "Hobart", "Perth") 
+```
+
+## Filtering Data
+
+To do the filtering of the weather stations down to only those located in major cities I’m going to use the *sf::st_intersects* function passing in the lat long coordinates as a geometry object, and the significant urban areas shape file as a simple feature (sf) collection, the *sf::st_intersects* function will then return the indexes of the polygon representing the urban area containing the coordinates, we can use those indices to get the name of the area from the shape file, then we can use *dplyr::filter* function to filter down to stations where the area is one of our major cities.
+
+```{r }
+# Here we are converting the weathre_stations dataframe to an sf object, and the lat lon values 
+# will form a geometry object.
+stations_sf <- st_as_sf(weather_stations, coords = c('lon', 'lat'), crs = st_crs(urban_areas_au))
+
+stations_in_major_cities = stations_sf %>% 
+  mutate(
+    # here we are using the sf::st_intersects function to identify which polygon's within the 
+    # shapefile contine the lat lon coordinates (geometry).
+    intersection = as.integer(st_intersects(geometry, urban_areas_au)) 
+    # here we are using the intersetion value obtained via sf::st_intersects to index into the 
+    # shapefile and store the name as area.
+    , area = if_else(is.na(intersection), '', urban_areas_au$SUA_NAME16[intersection])
+  ) %>% 
+  # now we can filter down to stations located in major cities.
+  filter(area %in% major_cities) %>%
+  inner_join(weather_stations %>% select(station_id, lat, lon), by = 'station_id')
+
+knitr::kable(head(stations_in_major_cities %>% select(name, station_id, geometry, intersection, area))) 
+```
+
+Now one thing you may notice when you run this is that the *sf::st_intersects* function prints a message stating that *‘although coordinates are longitude/latitude, st_intersects assumes that they are planar’* so what does this mean? Basically this message is telling us that sf is assuming a flat plane which could lead to inaccuracies when dealing with geographical coordinates because the earth is an ellipsoid, and a straight line between any two points will tend to be curved when projected onto an ellipsoid, so this is a fair warning and you need to make sure you check for accuracy. 
+
+According to [this](https://github.com/r-spatial/sf/issues/493) github issue which discusses the above message it's only a problem when you are dealing with large areas close to the poles, so for this data it shouldn’t be a problem.
+
+So now I will move onto the second requirement where we want to find the weather stations which are the closest to solar farms, here I am defining the function used to calculate the distance between sets of latitude and longitude coordinates, the distance method used here is ‘Haversince’ this method assumes a spherical earth, ignoring ellipsoidal effects therefore the calculations are not 100% correct but they are close enough for what we are doing here.
+
+
+```{r distance}
+find_closest_station <- function(lat_arg, lon_arg){
+
+  result <- weather_stations %>% 
+    # calculating the distance between the lat lon's
+    mutate(distance = distHaversine(cbind(lon, lat), cbind(lon_arg, lat_arg))) %>%
+    # sorting by the distance
+    arrange(distance) %>%
+    # now take the first row which will be the closest
+    filter(row_number()==1)
+  
+  return(result)
+}
+
+solar_farm_details <- solar_farm_details %>%
+  mutate(
+    closest_station_id = mapply(
+      function(lt, ln) find_closest_station(lt, ln)$station_id
+      , lats
+      , lons
+    )
+  ) 
+```
+
+## Re-combining the Data
+
+Now I’m going to combine my data into a single data frame which I will use to build the visualisation in leaflet so I will also add in values for color, radius, opacity and a label which will be used for display settings in the plot and for building the legend, its handy to have the data put together like this for building a visual but obviously you wouldn’t do it like this for feeding into a machine learning model.
+
+```{r}
+final_data <- weather_stations %>% 
+  filter(station_id %in% stations_in_major_cities$station_id) %>% 
+  mutate(
+    label = 'Urban Weather Station'
+    , color = 'green'
+    , opacity = 1
+    , radius = 2
+  ) %>%
+  select(lat, lon, label, station_id, color, opacity, radius) %>%
+  union(
+    weather_stations %>%
+      filter(station_id %in% solar_farm_details$closest_station_id) %>%
+      mutate(
+        label = 'Close to Solar Farm'
+        , color = 'red'
+        , opacity = 1
+        , radius = 2
+      ) %>%
+      select(lat, lon, label, station_id, color, opacity, radius)
+  ) %>%
+  union(
+    weather_stations %>% 
+      filter(
+        !(station_id %in% stations_in_major_cities$station_id) & 
+        !(station_id %in% solar_farm_details$closest_station_id)
+      ) %>%
+      mutate(
+        label = 'Regional Weather Station'
+        , color = 'grey'
+        , opacity = 0.5
+        , radius = 2
+      ) %>%
+      select(lat, lon, label, station_id, color, opacity, radius)
+  ) %>%
+  union(
+    solar_farm_details %>%
+      mutate(
+        lat = lats
+        , lon = lons
+        , label = 'Solar Farm'
+        , station_id = 'N/A'
+        , color = 'orange', opacity = 1, radius = 3
+      ) %>%
+      select(lat, lon, label, station_id, color, opacity, radius)
+  )
+```
+
+## Visualising the Data
+
+Now I’m going plot these weather stations over a map using leaflet, all the weather stations in the major cities I’m going to mark as green, all the stations close to solar farms I’m going to mark as red, and all the other regional weather stations I’m going to mark as gray and set the opacity to 0.5, I’m also going to plot the solar farms as orange and make the radius for these a bit bigger so they stand out a bit more.
+
+```{r leaflet, fig.width=9.5}
+city_shapes <- map[map$SUA_NAME16 %in% major_cities,]
+legend <- unique(final_data %>% select(label, color))
+
+vis_map <- leaflet(options = leafletOptions(zoomControl = FALSE, minZoom = 4, maxZoom = 4)) %>% 
+  addTiles() %>% 
+  setView(lat = -28.568210,lng = 133.894241, zoom = 4) %>%
+  addPolygons(data=city_shapes,weight=1,col = 'red', fillOpacity = 0.1) %>%
+  addCircleMarkers(
+    lat = final_data$lat
+    , lng = final_data$lon
+    , radius = final_data$radius
+    , stroke = FALSE
+    , color = final_data$color
+    , fillOpacity = final_data$opacity
+  ) %>%
+  addLegend("bottomright"
+            , values = legend$label
+            , labels = legend$label,
+              colors = legend$color,
+    opacity = 0.5
+  )
+
+vis_map
+```
+
+We can see in this plot the stations we are interested in stand out quite clearly, all the green stations are indeed located in the major cities, and all the red stations are close to the orange solar farms, I’ve also added the city polygon’s to this plot although at this zoom level it's hard to make them out, so let's zoom in a bit so we can have a closer look at Adelaide, Melbourne & Sydney. 
+
+```{r, fig.width=9.5}
+vis_map$x$options <- leafletOptions(zoomControl = FALSE, minZoom = 6, maxZoom = 6)
+vis_map %>% setView(lat = -35.568210,lng = 144.894241, zoom = 6)
+```
+
+So with the map zoomed in closer we can see more clearly the green dots within the city polygon’s overlayed on the map, and the weather stations closest to solar farms represented by the red dots.
+
+## References
+
+ - GitHub. (2019). Question about processing message on st_intersects · Issue #493 · r-spatial/sf. [online] Available at: https://github.com/r-spatial/sf/issues/493 [Accessed 30 Nov. 2019].
+ - Rdocumentation.org. (2019). distHaversine function | R Documentation. [online] Available at: https://www.rdocumentation.org/packages/geosphere/versions/1.5-10/topics/distHaversine [Accessed 3 Dec. 2019].
+ - Abs.gov.au. (2019). 1270.0.55.004 - Australian Statistical Geography Standard (ASGS): Volume 4 - Significant Urban Areas, Urban Centres and Localities, Section of State, July 2016. [online] Available at: https://www.abs.gov.au/AUSSTATS/abs@.nsf/Lookup/1270.0.55.004Explanatory%20Notes1July%202016?OpenDocument [Accessed 4 Dec. 2019].
